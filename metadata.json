@@ -1,0 +1,8 @@
+{
+  "name": "Remix Freshway Water POS \u0026 Customer Ledger",
+  "description": "Professional Point of Sale, monthly customer ledger billing, payment collection, and inventory management system with zero fake data.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
