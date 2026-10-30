@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
-import { db, hashPassword, verifyPassword, syncDataToMongoAtlas } from './db.ts';
+import { db, hashPassword, verifyPassword, syncDataToMongoAtlas, hydrateFromMongoAtlas } from './db.ts';
 import {
   generateToken,
   checkRateLimit,
@@ -78,9 +78,13 @@ export function logAudit(
 // -------------------------------------------------------------
 
 // Check if first-time admin setup is needed
-apiRouter.get('/auth/status', (req, res) => {
+apiRouter.get('/auth/status', async (req, res) => {
   try {
-    const countRow = db.prepare('SELECT COUNT(*) as userCount FROM users').get() as { userCount: number };
+    let countRow = db.prepare('SELECT COUNT(*) as userCount FROM users').get() as { userCount: number };
+    if (countRow.userCount === 0 && mongoose.connection.readyState === 1) {
+      await hydrateFromMongoAtlas();
+      countRow = db.prepare('SELECT COUNT(*) as userCount FROM users').get() as { userCount: number };
+    }
     const settings = db.prepare("SELECT * FROM business_settings WHERE id = 'default'").get();
     const mongoStatus = getMongoDBStatus();
 
@@ -183,7 +187,7 @@ apiRouter.post('/auth/setup', async (req, res) => {
 });
 
 // Login with Rate Limiting & PBKDF2 Verification
-apiRouter.post('/auth/login', (req, res) => {
+apiRouter.post('/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -202,9 +206,16 @@ apiRouter.post('/auth/login', (req, res) => {
       });
     }
 
-    const user = db.prepare(`
+    let user = db.prepare(`
       SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?
     `).get(cleanInput, cleanInput) as any;
+
+    if (!user && mongoose.connection.readyState === 1) {
+      await hydrateFromMongoAtlas();
+      user = db.prepare(`
+        SELECT * FROM users WHERE LOWER(username) = ? OR LOWER(email) = ?
+      `).get(cleanInput, cleanInput) as any;
+    }
 
     if (!user) {
       recordFailedAttempt(rateLimitKey);
@@ -487,9 +498,10 @@ apiRouter.post('/database/connect', requireRole(['admin']), async (req: Authenti
     const now = new Date().toISOString();
     db.prepare("UPDATE business_settings SET mongoDbUriConfigured = ?, updatedAt = ? WHERE id = 'default'").run(cleanUri, now);
 
-    // Sync all existing data to the newly connected Atlas cluster
+    // Hydrate from Atlas first (in case Atlas already has production records) and then sync local data to Atlas
     let syncResult = null;
     try {
+      await hydrateFromMongoAtlas();
       syncResult = await syncDataToMongoAtlas();
     } catch (syncErr: any) {
       console.warn('Sync notice:', syncErr.message);
@@ -579,7 +591,12 @@ apiRouter.post('/customers', requireAuth, async (req: AuthenticatedRequest, res)
     }
 
     const countRow = db.prepare('SELECT COUNT(*) as c FROM customers').get() as { c: number };
-    const custId = `CUST-${String(countRow.c + 1).padStart(4, '0')}`;
+    let seq = countRow.c + 1;
+    let custId = `CUST-${String(seq).padStart(4, '0')}`;
+    while (db.prepare('SELECT id FROM customers WHERE id = ?').get(custId)) {
+      seq++;
+      custId = `CUST-${String(seq).padStart(4, '0')}`;
+    }
     const openBal = parseFloat(openingBalance) || 0;
     const now = new Date().toISOString();
 
@@ -616,20 +633,7 @@ apiRouter.post('/customers', requireAuth, async (req: AuthenticatedRequest, res)
 
       // Mirror to MongoDB Atlas if connected
       if (mongoose.connection.readyState === 1) {
-        CustomerModel.create({
-          id: custId,
-          name: cleanName,
-          phone: cleanPhone,
-          email: email || '',
-          address: address || '',
-          category: category || 'Retail',
-          openingBalance: openBal,
-          currentBalance: openBal,
-          notes: notes || '',
-          isActive: 1,
-          createdAt: now,
-          updatedAt: now,
-        }).catch((err) => console.error('Atlas Customer Create Err:', err.message));
+        syncDataToMongoAtlas().catch((err) => console.error('Atlas Customer Sync Err:', err.message));
       }
 
       const callerName = req.userPayload?.username || createdByName || 'User';
@@ -911,7 +915,12 @@ apiRouter.post('/products', requireRole(['admin', 'manager']), async (req: Authe
     let finalSku = sku ? String(sku).trim() : '';
     if (!finalSku) {
       const pCount = db.prepare('SELECT COUNT(*) as c FROM products').get() as { c: number };
-      finalSku = `PROD-${String(pCount.c + 1).padStart(4, '0')}`;
+      let seq = pCount.c + 1;
+      finalSku = `PROD-${String(seq).padStart(4, '0')}`;
+      while (db.prepare('SELECT id FROM products WHERE sku = ?').get(finalSku)) {
+        seq++;
+        finalSku = `PROD-${String(seq).padStart(4, '0')}`;
+      }
     }
 
     const existing = db.prepare('SELECT id FROM products WHERE sku = ?').get(finalSku);
@@ -946,21 +955,7 @@ apiRouter.post('/products', requireRole(['admin', 'manager']), async (req: Authe
 
       // Mirror to MongoDB Atlas
       if (mongoose.connection.readyState === 1) {
-        ProductModel.create({
-          id: prodId,
-          name: cleanName,
-          sku: finalSku,
-          categoryName: categoryName || 'General',
-          costPrice: cost,
-          sellingPrice: sell,
-          stockQuantity: initStock,
-          unit: unit || 'Bottle',
-          barcode: barcode || '',
-          lowStockThreshold: lowThreshold,
-          isActive: 1,
-          createdAt: now,
-          updatedAt: now,
-        }).catch((err) => console.error('Atlas Product Create Err:', err.message));
+        syncDataToMongoAtlas().catch((err) => console.error('Atlas Product Sync Err:', err.message));
       }
 
       const callerName = req.userPayload?.username || createdByName || 'User';
@@ -1195,8 +1190,15 @@ apiRouter.post('/invoices', requireAuth, async (req: AuthenticatedRequest, res) 
     const invoiceId = crypto.randomUUID();
 
     const currentYear = new Date().getFullYear();
-    const countRow = db.prepare("SELECT COUNT(*) as c FROM invoices WHERE invoiceNumber LIKE ?").get(`INV-${currentYear}-%`) as { c: number };
-    const invoiceNumber = `INV-${currentYear}-${String(countRow.c + 1).padStart(4, '0')}`;
+    const settingsRow = db.prepare("SELECT invoicePrefix FROM business_settings WHERE id = 'default'").get() as { invoicePrefix?: string } | undefined;
+    const prefix = (settingsRow?.invoicePrefix || 'INV').trim().toUpperCase();
+    const countRow = db.prepare("SELECT COUNT(*) as c FROM invoices WHERE invoiceNumber LIKE ?").get(`${prefix}-${currentYear}-%`) as { c: number };
+    let invSeq = countRow.c + 1;
+    let invoiceNumber = `${prefix}-${currentYear}-${String(invSeq).padStart(4, '0')}`;
+    while (db.prepare('SELECT id FROM invoices WHERE invoiceNumber = ?').get(invoiceNumber)) {
+      invSeq++;
+      invoiceNumber = `${prefix}-${currentYear}-${String(invSeq).padStart(4, '0')}`;
+    }
 
     const paid = parseFloat(paidAmount) || 0;
     const total = parseFloat(grandTotal) || 0;
@@ -1330,7 +1332,12 @@ apiRouter.post('/invoices', requireAuth, async (req: AuthenticatedRequest, res) 
 
           if (paid > 0) {
             const receiptCount = db.prepare("SELECT COUNT(*) as c FROM payments WHERE receiptNumber LIKE ?").get(`REC-${currentYear}-%`) as { c: number };
-            const receiptNumber = `REC-${currentYear}-${String(receiptCount.c + 1).padStart(4, '0')}`;
+            let recSeq = receiptCount.c + 1;
+            let receiptNumber = `REC-${currentYear}-${String(recSeq).padStart(4, '0')}`;
+            while (db.prepare('SELECT id FROM payments WHERE receiptNumber = ?').get(receiptNumber)) {
+              recSeq++;
+              receiptNumber = `REC-${currentYear}-${String(recSeq).padStart(4, '0')}`;
+            }
             const paymentId = crypto.randomUUID();
 
             db.prepare(`
@@ -1376,34 +1383,9 @@ apiRouter.post('/invoices', requireAuth, async (req: AuthenticatedRequest, res) 
 
       db.exec('COMMIT;');
 
-      // Mirror to MongoDB Atlas
+      // Mirror all affected tables (invoices, products stock, stock_movements, payments, customer_ledger, customers balance) to MongoDB Atlas
       if (mongoose.connection.readyState === 1) {
-        InvoiceModel.create({
-          id: invoiceId,
-          invoiceNumber,
-          customerId: isWalkIn ? null : (customerId || null),
-          customerName: customerName || (isWalkIn ? 'Walk-in Customer' : 'Customer'),
-          customerPhone: customerPhone || '',
-          customerAddress: customerAddress || '',
-          isWalkIn: isWalkIn ? 1 : 0,
-          items: mongoItems,
-          subtotal: subtotal || 0,
-          discountType: discountType || 'fixed',
-          discountValue: discountValue || 0,
-          discountAmount: discountAmount || 0,
-          taxAmount: taxAmount || 0,
-          grandTotal: total,
-          paidAmount: paid,
-          balanceAmount: balance,
-          paymentMethod: paymentMethod || 'Cash',
-          paymentStatus: paymentStatus as any,
-          notes: notes || '',
-          createdById: createdById || null,
-          createdByName: createdByName || 'Staff',
-          isCancelled: 0,
-          createdAt: now,
-          updatedAt: now,
-        }).catch((err) => console.error('Atlas Invoice Create Err:', err.message));
+        syncDataToMongoAtlas().catch((err) => console.error('Atlas Invoice Sync Err:', err.message));
       }
 
       const callerName = req.userPayload?.username || createdByName || 'Staff';
@@ -1504,12 +1486,9 @@ apiRouter.post('/invoices/:id/cancel', requireRole(['admin', 'manager']), async 
 
       db.exec('COMMIT;');
 
-      // Mirror to MongoDB Atlas
+      // Mirror all affected tables to MongoDB Atlas
       if (mongoose.connection.readyState === 1) {
-        InvoiceModel.findOneAndUpdate(
-          { id },
-          { isCancelled: 1, cancelReason: cleanReason, cancelledAt: now, cancelledByName: canceller, updatedAt: now }
-        ).catch((err) => console.error(err));
+        syncDataToMongoAtlas().catch((err) => console.error('Atlas Cancel Invoice Sync Err:', err.message));
       }
 
       const callerId = req.userPayload?.userId || cancelledById || null;
@@ -1562,7 +1541,7 @@ apiRouter.get('/payments', requireAuth, (req, res) => {
 
 apiRouter.post('/payments', requireAuth, async (req: AuthenticatedRequest, res) => {
   try {
-    const { customerId, invoiceId, amount, paymentMethod, referenceNumber, notes, createdByName, createdById } = req.body;
+    const { customerId, invoiceId, amount, paymentMethod, referenceNumber, notes, paymentDate, createdByName, createdById } = req.body;
     if (!customerId || !amount || parseFloat(amount) <= 0) {
       return res.status(400).json({ error: 'Customer and valid payment amount are required.' });
     }
@@ -1575,9 +1554,18 @@ apiRouter.post('/payments', requireAuth, async (req: AuthenticatedRequest, res) 
 
     const currentYear = new Date().getFullYear();
     const countRow = db.prepare("SELECT COUNT(*) as c FROM payments WHERE receiptNumber LIKE ?").get(`REC-${currentYear}-%`) as { c: number };
-    const receiptNumber = `REC-${currentYear}-${String(countRow.c + 1).padStart(4, '0')}`;
+    let recSeq = countRow.c + 1;
+    let receiptNumber = `REC-${currentYear}-${String(recSeq).padStart(4, '0')}`;
+    while (db.prepare('SELECT id FROM payments WHERE receiptNumber = ?').get(receiptNumber)) {
+      recSeq++;
+      receiptNumber = `REC-${currentYear}-${String(recSeq).padStart(4, '0')}`;
+    }
     const paymentId = crypto.randomUUID();
-    const now = new Date().toISOString();
+    const nowIso = new Date().toISOString();
+    const now =
+      paymentDate && /^\d{4}-\d{2}-\d{2}$/.test(String(paymentDate)) && String(paymentDate) !== nowIso.split('T')[0]
+        ? `${paymentDate}T12:00:00.000Z`
+        : nowIso;
 
     let invoiceNum: string | null = null;
     let targetInvoice: any = null;
@@ -1610,7 +1598,7 @@ apiRouter.post('/payments', requireAuth, async (req: AuthenticatedRequest, res) 
       );
 
       const newCustomerBalance = customer.currentBalance - payAmount;
-      db.prepare('UPDATE customers SET currentBalance = ?, updatedAt = ? WHERE id = ?').run(newCustomerBalance, now, customerId);
+      db.prepare('UPDATE customers SET currentBalance = ?, updatedAt = ? WHERE id = ?').run(newCustomerBalance, nowIso, customerId);
 
       const desc = invoiceNum ? `Payment received for ${invoiceNum} [${receiptNumber}]` : `Account Payment / Udhaar Collection [${receiptNumber}]`;
       db.prepare(`
@@ -1632,31 +1620,16 @@ apiRouter.post('/payments', requireAuth, async (req: AuthenticatedRequest, res) 
           newPaid,
           newBal,
           newStatus,
-          now,
+          nowIso,
           invoiceId
         );
       }
 
       db.exec('COMMIT;');
 
-      // Mirror to MongoDB Atlas
+      // Mirror all affected tables (payments, customers, customer_ledger, invoices) to MongoDB Atlas
       if (mongoose.connection.readyState === 1) {
-        PaymentModel.create({
-          id: paymentId,
-          receiptNumber,
-          customerId,
-          customerName: customer.name,
-          invoiceId: invoiceId || null,
-          invoiceNumber: invoiceNum,
-          amount: payAmount,
-          paymentMethod: paymentMethod || 'Cash',
-          referenceNumber: referenceNumber || '',
-          notes: notes || '',
-          createdById: createdById || null,
-          createdByName: createdByName || 'Staff',
-          isVoided: 0,
-          createdAt: now,
-        }).catch((err) => console.error(err));
+        syncDataToMongoAtlas().catch((err) => console.error('Atlas Payment Sync Err:', err.message));
       }
 
       const callerName = req.userPayload?.username || createdByName || 'Staff';
@@ -1753,12 +1726,9 @@ apiRouter.post('/payments/:id/void', requireRole(['admin']), async (req: Authent
 
       db.exec('COMMIT;');
 
-      // Mirror to MongoDB Atlas
+      // Mirror all affected tables to MongoDB Atlas
       if (mongoose.connection.readyState === 1) {
-        PaymentModel.findOneAndUpdate(
-          { id },
-          { isVoided: 1, voidReason: cleanReason, voidedAt: now, voidedByName: voider }
-        ).catch((err) => console.error(err));
+        syncDataToMongoAtlas().catch((err) => console.error('Atlas Void Payment Sync Err:', err.message));
       }
 
       const callerId = req.userPayload?.userId || voidedById || null;
@@ -1851,7 +1821,12 @@ apiRouter.post('/purchases', requireRole(['admin', 'manager']), async (req: Auth
 
     const currentYear = new Date().getFullYear();
     const countRow = db.prepare("SELECT COUNT(*) as c FROM purchases WHERE purchaseNumber LIKE ?").get(`PUR-${currentYear}-%`) as { c: number };
-    const purchaseNumber = `PUR-${currentYear}-${String(countRow.c + 1).padStart(4, '0')}`;
+    let purSeq = countRow.c + 1;
+    let purchaseNumber = `PUR-${currentYear}-${String(purSeq).padStart(4, '0')}`;
+    while (db.prepare('SELECT id FROM purchases WHERE purchaseNumber = ?').get(purchaseNumber)) {
+      purSeq++;
+      purchaseNumber = `PUR-${currentYear}-${String(purSeq).padStart(4, '0')}`;
+    }
     const purchaseId = crypto.randomUUID();
     const now = new Date().toISOString();
 
@@ -1889,7 +1864,7 @@ apiRouter.post('/purchases', requireRole(['admin', 'manager']), async (req: Auth
 
       const mongoItems: any[] = [];
       for (const item of items) {
-        const prod = db.prepare('SELECT stockQuantity FROM products WHERE id = ?').get(item.productId) as any;
+        const prod = db.prepare('SELECT stockQuantity, costPrice FROM products WHERE id = ?').get(item.productId) as any;
         const currentStock = prod ? prod.stockQuantity : 0;
         const itemQty = parseFloat(item.quantity) || 1;
         const itemCost = parseFloat(item.unitCost) || 0;
@@ -1949,24 +1924,9 @@ apiRouter.post('/purchases', requireRole(['admin', 'manager']), async (req: Auth
 
       db.exec('COMMIT;');
 
-      // Mirror to MongoDB Atlas
+      // Mirror all affected tables (purchases, products, stock_movements, suppliers) to MongoDB Atlas
       if (mongoose.connection.readyState === 1) {
-        PurchaseModel.create({
-          id: purchaseId,
-          purchaseNumber,
-          supplierId,
-          supplierName,
-          items: mongoItems,
-          totalAmount: total,
-          paidAmount: paid,
-          balanceAmount: balance,
-          paymentStatus: paymentStatus as any,
-          paymentMethod: paymentMethod || 'Cash',
-          notes: notes || '',
-          createdById: createdById || null,
-          createdByName: createdByName || 'Staff',
-          createdAt: now,
-        }).catch((err) => console.error(err));
+        syncDataToMongoAtlas().catch((err) => console.error('Atlas Purchase Sync Err:', err.message));
       }
 
       const callerName = req.userPayload?.username || createdByName || 'Staff';

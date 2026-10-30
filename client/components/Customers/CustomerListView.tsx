@@ -23,11 +23,13 @@ import type { ActiveTab } from '../Layout/Sidebar';
 interface CustomerListViewProps {
   setActiveTab: (tab: ActiveTab) => void;
   onSelectCustomerForLedger?: (customerId: string) => void;
+  onSelectCustomerForPayment?: (customerId: string) => void;
 }
 
 export const CustomerListView: React.FC<CustomerListViewProps> = ({
   setActiveTab,
   onSelectCustomerForLedger,
+  onSelectCustomerForPayment,
 }) => {
   const { settings, formatCurrency } = useSettings();
   const { user } = useAuth();
@@ -304,7 +306,13 @@ export const CustomerListView: React.FC<CustomerListViewProps> = ({
                           <BookOpen className="w-4 h-4" />
                         </button>
                         <button
-                          onClick={() => setActiveTab('payments')}
+                          onClick={() => {
+                            if (onSelectCustomerForPayment) {
+                              onSelectCustomerForPayment(c.id);
+                            } else {
+                              setActiveTab('payments');
+                            }
+                          }}
                           title="Collect Udhaar Payment"
                           className="p-1.5 rounded-lg text-emerald-600 hover:bg-emerald-50 dark:hover:bg-slate-800 cursor-pointer"
                         >

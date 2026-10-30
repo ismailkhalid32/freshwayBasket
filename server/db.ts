@@ -326,15 +326,397 @@ export function initDatabase() {
 
   if (targetMongoUri && targetMongoUri.trim()) {
     connectMongoDB(targetMongoUri.trim())
-      .then((res) => {
+      .then(async (res) => {
         if (res.success && mongoose.connection.readyState === 1) {
           console.log('[MongoDB Atlas] Auto-connected on server boot.');
-          syncDataToMongoAtlas().catch((err) => console.log('[MongoDB Atlas Sync notice]:', err.message));
+          await hydrateFromMongoAtlas().catch((err) => console.log('[MongoDB Atlas Hydrate notice]:', err.message));
+          await syncDataToMongoAtlas().catch((err) => console.log('[MongoDB Atlas Sync notice]:', err.message));
         }
       })
       .catch((err) => {
         console.log('[MongoDB Atlas] Initial boot connection deferred:', err.message);
       });
+  }
+}
+
+// -------------------------------------------------------------
+// HYDRATE LOCAL ENGINE FROM MONGODB ATLAS (FOR RENDER EPHEMERAL RESTARTS)
+// -------------------------------------------------------------
+export async function hydrateFromMongoAtlas(): Promise<void> {
+  if (mongoose.connection.readyState !== 1) return;
+
+  try {
+    // 1. Business Settings
+    const remoteSettings = await BusinessSettingsModel.findOne({ id: 'default' }).lean();
+    if (remoteSettings) {
+      db.prepare(`
+        UPDATE business_settings SET
+          businessName = ?, tagline = ?, phone = ?, email = ?, address = ?,
+          currencySymbol = ?, taxPercentage = ?, receiptFooter = ?, invoicePrefix = ?,
+          lowStockDefaultThreshold = ?, theme = ?, logoDataUrl = ?, updatedAt = ?
+        WHERE id = 'default'
+      `).run(
+        remoteSettings.businessName || 'Freshway Water',
+        remoteSettings.tagline || '',
+        remoteSettings.phone || '',
+        remoteSettings.email || '',
+        remoteSettings.address || '',
+        remoteSettings.currencySymbol || 'Rs',
+        remoteSettings.taxPercentage || 0,
+        remoteSettings.receiptFooter || '',
+        remoteSettings.invoicePrefix || 'INV',
+        remoteSettings.lowStockDefaultThreshold || 10,
+        remoteSettings.theme || 'light',
+        remoteSettings.logoDataUrl || '',
+        remoteSettings.updatedAt || new Date().toISOString()
+      );
+    }
+
+    // 2. Users (include passwordHash and salt for login authentication)
+    const remoteUsers = await UserModel.find().select('+passwordHash +salt').lean();
+    if (remoteUsers.length > 0) {
+      const upsertUser = db.prepare(`
+        INSERT OR REPLACE INTO users (id, username, email, fullName, role, passwordHash, salt, isActive, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const u of remoteUsers) {
+        if (u.passwordHash && u.salt) {
+          upsertUser.run(
+            u.id,
+            u.username,
+            u.email,
+            u.fullName,
+            u.role,
+            u.passwordHash,
+            u.salt,
+            u.isActive !== undefined ? u.isActive : 1,
+            u.createdAt,
+            u.updatedAt
+          );
+        }
+      }
+    }
+
+    // 3. Categories
+    const remoteCategories = await CategoryModel.find().lean();
+    if (remoteCategories.length > 0) {
+      const upsertCat = db.prepare(`
+        INSERT OR REPLACE INTO categories (id, name, description, createdAt)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const cat of remoteCategories) {
+        upsertCat.run(cat.id, cat.name, cat.description || '', cat.createdAt);
+      }
+    }
+
+    // 4. Customers
+    const remoteCustomers = await CustomerModel.find().lean();
+    if (remoteCustomers.length > 0) {
+      const upsertCust = db.prepare(`
+        INSERT OR REPLACE INTO customers (id, name, phone, email, address, category, openingBalance, currentBalance, notes, isActive, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const c of remoteCustomers) {
+        upsertCust.run(
+          c.id,
+          c.name,
+          c.phone,
+          c.email || '',
+          c.address || '',
+          c.category || 'Retail',
+          c.openingBalance || 0,
+          c.currentBalance || 0,
+          c.notes || '',
+          c.isActive !== undefined ? c.isActive : 1,
+          c.createdAt,
+          c.updatedAt
+        );
+      }
+    }
+
+    // 5. Products
+    const remoteProducts = await ProductModel.find().lean();
+    if (remoteProducts.length > 0) {
+      const upsertProd = db.prepare(`
+        INSERT OR REPLACE INTO products (id, name, sku, categoryId, categoryName, costPrice, sellingPrice, stockQuantity, unit, barcode, lowStockThreshold, isActive, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const p of remoteProducts) {
+        upsertProd.run(
+          p.id,
+          p.name,
+          p.sku,
+          (p as any).categoryId || null,
+          p.categoryName || 'General',
+          p.costPrice || 0,
+          p.sellingPrice || 0,
+          p.stockQuantity || 0,
+          p.unit || 'Bottle',
+          p.barcode || '',
+          p.lowStockThreshold || 10,
+          p.isActive !== undefined ? p.isActive : 1,
+          p.createdAt,
+          p.updatedAt
+        );
+      }
+    }
+
+    // 6. Stock Movements
+    const remoteMovements = await StockMovementModel.find().lean();
+    if (remoteMovements.length > 0) {
+      const upsertMov = db.prepare(`
+        INSERT OR REPLACE INTO stock_movements (id, productId, movementType, quantity, previousStock, newStock, referenceId, reason, createdByName, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const m of remoteMovements) {
+        upsertMov.run(
+          m.id,
+          m.productId,
+          m.movementType,
+          m.quantity,
+          m.previousStock,
+          m.newStock,
+          m.referenceId || '',
+          m.reason || '',
+          m.createdByName || 'Staff',
+          m.createdAt
+        );
+      }
+    }
+
+    // 7. Invoices & Invoice Items
+    const remoteInvoices = await InvoiceModel.find().lean();
+    if (remoteInvoices.length > 0) {
+      const upsertInv = db.prepare(`
+        INSERT OR REPLACE INTO invoices (
+          id, invoiceNumber, customerId, customerName, customerPhone, customerAddress, isWalkIn,
+          subtotal, discountType, discountValue, discountAmount, taxAmount, grandTotal,
+          paidAmount, balanceAmount, paymentMethod, paymentStatus, notes, createdById, createdByName,
+          isCancelled, cancelReason, cancelledAt, cancelledByName, createdAt, updatedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const upsertInvItem = db.prepare(`
+        INSERT OR REPLACE INTO invoice_items (id, invoiceId, productId, productName, sku, unit, unitPrice, costPrice, quantity, discountAmount, totalAmount)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const inv of remoteInvoices) {
+        upsertInv.run(
+          inv.id,
+          inv.invoiceNumber,
+          inv.customerId || null,
+          inv.customerName,
+          inv.customerPhone || '',
+          inv.customerAddress || '',
+          inv.isWalkIn ? 1 : 0,
+          inv.subtotal || 0,
+          inv.discountType || 'fixed',
+          inv.discountValue || 0,
+          inv.discountAmount || 0,
+          inv.taxAmount || 0,
+          inv.grandTotal || 0,
+          inv.paidAmount || 0,
+          inv.balanceAmount || 0,
+          inv.paymentMethod || 'Cash',
+          inv.paymentStatus || 'Paid',
+          inv.notes || '',
+          inv.createdById || null,
+          inv.createdByName || 'Staff',
+          inv.isCancelled ? 1 : 0,
+          inv.cancelReason || '',
+          inv.cancelledAt || '',
+          inv.cancelledByName || '',
+          inv.createdAt,
+          inv.updatedAt
+        );
+        if (Array.isArray(inv.items)) {
+          for (const it of inv.items as any[]) {
+            upsertInvItem.run(
+              it.id || crypto.randomUUID(),
+              inv.id,
+              it.productId,
+              it.productName,
+              it.sku || '',
+              it.unit || 'Bottle',
+              it.unitPrice || 0,
+              it.costPrice || 0,
+              it.quantity || 1,
+              it.discountAmount || 0,
+              it.totalAmount || 0
+            );
+          }
+        }
+      }
+    }
+
+    // 8. Payments
+    const remotePayments = await PaymentModel.find().lean();
+    if (remotePayments.length > 0) {
+      const upsertPay = db.prepare(`
+        INSERT OR REPLACE INTO payments (id, receiptNumber, customerId, customerName, invoiceId, invoiceNumber, amount, paymentMethod, referenceNumber, notes, createdById, createdByName, isVoided, voidReason, voidedAt, voidedByName, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const p of remotePayments) {
+        upsertPay.run(
+          p.id,
+          p.receiptNumber,
+          p.customerId,
+          p.customerName,
+          p.invoiceId || null,
+          p.invoiceNumber || '',
+          p.amount,
+          p.paymentMethod || 'Cash',
+          p.referenceNumber || '',
+          p.notes || '',
+          p.createdById || null,
+          p.createdByName || 'Staff',
+          p.isVoided ? 1 : 0,
+          p.voidReason || '',
+          p.voidedAt || '',
+          p.voidedByName || '',
+          p.createdAt
+        );
+      }
+    }
+
+    // 9. Customer Ledger
+    const remoteLedger = await CustomerLedgerModel.find().lean();
+    if (remoteLedger.length > 0) {
+      const upsertLed = db.prepare(`
+        INSERT OR REPLACE INTO customer_ledger (id, customerId, transactionType, referenceId, referenceNumber, description, debit, credit, runningBalance, paymentMethod, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const l of remoteLedger) {
+        upsertLed.run(
+          l.id,
+          l.customerId,
+          l.transactionType,
+          l.referenceId || null,
+          l.referenceNumber || '',
+          l.description,
+          l.debit || 0,
+          l.credit || 0,
+          l.runningBalance || 0,
+          l.paymentMethod || '',
+          l.createdAt
+        );
+      }
+    }
+
+    // 10. Suppliers
+    const remoteSuppliers = await SupplierModel.find().lean();
+    if (remoteSuppliers.length > 0) {
+      const upsertSup = db.prepare(`
+        INSERT OR REPLACE INTO suppliers (id, name, company, phone, email, address, openingBalance, currentBalance, notes, isActive, createdAt, updatedAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const s of remoteSuppliers) {
+        upsertSup.run(
+          s.id,
+          s.name,
+          s.company || '',
+          s.phone,
+          s.email || '',
+          s.address || '',
+          s.openingBalance || 0,
+          s.currentBalance || 0,
+          s.notes || '',
+          s.isActive !== undefined ? s.isActive : 1,
+          s.createdAt,
+          s.updatedAt
+        );
+      }
+    }
+
+    // 11. Purchases & Purchase Items
+    const remotePurchases = await PurchaseModel.find().lean();
+    if (remotePurchases.length > 0) {
+      const upsertPur = db.prepare(`
+        INSERT OR REPLACE INTO purchases (id, purchaseNumber, supplierId, supplierName, totalAmount, paidAmount, balanceAmount, paymentStatus, paymentMethod, notes, createdById, createdByName, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const upsertPurItem = db.prepare(`
+        INSERT OR REPLACE INTO purchase_items (id, purchaseId, productId, productName, unit, quantity, unitCost, totalAmount)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const pur of remotePurchases) {
+        upsertPur.run(
+          pur.id,
+          pur.purchaseNumber,
+          pur.supplierId,
+          pur.supplierName,
+          pur.totalAmount || 0,
+          pur.paidAmount || 0,
+          pur.balanceAmount || 0,
+          pur.paymentStatus || 'Paid',
+          pur.paymentMethod || 'Cash',
+          pur.notes || '',
+          pur.createdById || null,
+          pur.createdByName || 'Staff',
+          pur.createdAt
+        );
+        if (Array.isArray(pur.items)) {
+          for (const pi of pur.items as any[]) {
+            upsertPurItem.run(
+              pi.id || crypto.randomUUID(),
+              pur.id,
+              pi.productId,
+              pi.productName,
+              pi.unit || 'Piece',
+              pi.quantity || 1,
+              pi.unitCost || 0,
+              pi.totalAmount || 0
+            );
+          }
+        }
+      }
+    }
+
+    // 12. Expenses
+    const remoteExpenses = await ExpenseModel.find().lean();
+    if (remoteExpenses.length > 0) {
+      const upsertExp = db.prepare(`
+        INSERT OR REPLACE INTO expenses (id, title, category, amount, paymentMethod, date, description, createdById, createdByName, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const exp of remoteExpenses) {
+        upsertExp.run(
+          exp.id,
+          exp.title,
+          exp.category,
+          exp.amount,
+          exp.paymentMethod || 'Cash',
+          exp.date,
+          exp.description || '',
+          exp.createdById || null,
+          exp.createdByName || 'Staff',
+          exp.createdAt
+        );
+      }
+    }
+
+    // 13. Audit Logs
+    const remoteLogs = await AuditLogModel.find().sort({ createdAt: -1 }).limit(300).lean();
+    if (remoteLogs.length > 0) {
+      const upsertLog = db.prepare(`
+        INSERT OR REPLACE INTO audit_logs (id, userId, userName, action, module, targetId, details, ipAddress, createdAt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const log of remoteLogs) {
+        upsertLog.run(
+          log.id,
+          log.userId || null,
+          log.userName,
+          log.action,
+          log.module,
+          log.targetId || null,
+          log.details || '',
+          log.ipAddress || '127.0.0.1',
+          log.createdAt
+        );
+      }
+    }
+  } catch (err: any) {
+    console.warn('[MongoDB Atlas Hydrate Warning]:', err.message);
   }
 }
 

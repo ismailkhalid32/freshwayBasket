@@ -181,6 +181,23 @@ export const POSView: React.FC = () => {
     );
   };
 
+  // Set cart quantity directly via numeric input
+  const setQuantityDirect = (productId: string, val: string) => {
+    const parsed = parseInt(val, 10);
+    const newQty = isNaN(parsed) || parsed < 1 ? 1 : parsed;
+    setCart((prev) =>
+      prev.map((item) =>
+        item.productId === productId
+          ? {
+              ...item,
+              quantity: newQty,
+              totalAmount: (item.unitPrice * newQty) - item.discountAmount,
+            }
+          : item
+      )
+    );
+  };
+
   // Remove cart item
   const removeFromCart = (productId: string) => {
     setCart((prev) => prev.filter((item) => item.productId !== productId));
@@ -306,9 +323,8 @@ export const POSView: React.FC = () => {
         setPaidAmount('');
         setNotes('');
 
-        // Refresh product stock counts
-        const updatedProds = await api.getProducts();
-        setProducts(updatedProds);
+        // Refresh product stock counts and customer Udhaar balances
+        await loadData();
       }
     } catch (err: any) {
       setError(`Sale submission error: ${err.message}`);
@@ -318,9 +334,9 @@ export const POSView: React.FC = () => {
   };
 
   return (
-    <div className="h-[calc(100vh-65px)] flex flex-col lg:flex-row bg-slate-100/60 dark:bg-slate-950 overflow-hidden">
+    <div className="min-h-[calc(100vh-65px)] lg:h-[calc(100vh-65px)] flex flex-col lg:flex-row bg-slate-100/60 dark:bg-slate-950 overflow-y-auto lg:overflow-hidden">
       {/* LEFT COLUMN: Product Catalog & Search */}
-      <div className="flex-1 flex flex-col h-full overflow-hidden p-4 border-r border-slate-200 dark:border-slate-800">
+      <div className="flex-1 flex flex-col min-h-[420px] lg:h-full overflow-hidden p-4 border-b lg:border-b-0 lg:border-r border-slate-200 dark:border-slate-800">
         {/* Search & Category Filter */}
         <div className="space-y-3 mb-4">
           <div className="relative">
@@ -423,7 +439,7 @@ export const POSView: React.FC = () => {
       </div>
 
       {/* RIGHT COLUMN: Active Cart & Fast Checkout */}
-      <div className="w-full lg:w-[420px] xl:w-[460px] bg-white dark:bg-slate-900 flex flex-col h-full shadow-xl border-l border-slate-200 dark:border-slate-800">
+      <div className="w-full lg:w-[420px] xl:w-[460px] bg-white dark:bg-slate-900 flex flex-col lg:h-full shadow-xl border-l border-slate-200 dark:border-slate-800">
         {/* Customer Header Box */}
         <div className="p-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/40 space-y-3">
           <div className="flex items-center justify-between">
@@ -431,6 +447,15 @@ export const POSView: React.FC = () => {
               Customer Assignment
             </span>
             <div className="flex items-center gap-1.5">
+              {cart.length > 0 && (
+                <button
+                  onClick={() => setCart([])}
+                  className="text-[11px] font-bold px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 hover:bg-rose-100 transition-colors cursor-pointer"
+                  title="Clear all items from cart"
+                >
+                  Clear Cart
+                </button>
+              )}
               <button
                 onClick={() => setIsWalkIn(!isWalkIn)}
                 className={`text-[11px] font-bold px-2.5 py-1 rounded-lg transition-colors cursor-pointer ${
@@ -488,7 +513,7 @@ export const POSView: React.FC = () => {
         </div>
 
         {/* Cart Items List */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
+        <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar min-h-[180px]">
           {error && (
             <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 text-xs flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -516,19 +541,23 @@ export const POSView: React.FC = () => {
                 </div>
 
                 {/* Quantity Controls */}
-                <div className="flex items-center gap-1.5 bg-white dark:bg-slate-900 px-2 py-1 rounded-xl border border-slate-200 dark:border-slate-700">
+                <div className="flex items-center gap-1 bg-white dark:bg-slate-900 px-1.5 py-1 rounded-xl border border-slate-200 dark:border-slate-700">
                   <button
                     onClick={() => updateQuantity(item.productId, -1)}
-                    className="w-5 h-5 flex items-center justify-center font-bold text-slate-500 hover:text-slate-800 cursor-pointer"
+                    className="w-5 h-5 flex items-center justify-center font-bold text-slate-500 hover:text-slate-800 dark:hover:text-white cursor-pointer"
                   >
                     -
                   </button>
-                  <span className="font-extrabold px-1 text-slate-900 dark:text-white min-w-[20px] text-center">
-                    {item.quantity}
-                  </span>
+                  <input
+                    type="number"
+                    min="1"
+                    value={item.quantity}
+                    onChange={(e) => setQuantityDirect(item.productId, e.target.value)}
+                    className="w-11 text-center font-extrabold text-xs text-slate-900 dark:text-white bg-transparent focus:outline-none"
+                  />
                   <button
                     onClick={() => updateQuantity(item.productId, 1)}
-                    className="w-5 h-5 flex items-center justify-center font-bold text-slate-500 hover:text-slate-800 cursor-pointer"
+                    className="w-5 h-5 flex items-center justify-center font-bold text-slate-500 hover:text-slate-800 dark:hover:text-white cursor-pointer"
                   >
                     +
                   </button>

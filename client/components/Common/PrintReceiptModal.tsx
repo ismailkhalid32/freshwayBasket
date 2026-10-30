@@ -80,7 +80,11 @@ export const PrintReceiptModal: React.FC<PrintReceiptModalProps> = ({ invoice, o
           >
             <div className="text-center pb-4 border-b border-dashed border-slate-300">
               <div className="flex justify-center mb-2">
-                <FreshwayLogo size={printFormat === 'thermal' ? 'sm' : 'md'} showText={true} />
+                <FreshwayLogo
+                  size={printFormat === 'thermal' ? 'sm' : 'md'}
+                  showText={true}
+                  customLogoUrl={settings.logoDataUrl}
+                />
               </div>
               <p className="font-bold text-sm">{settings.businessName}</p>
               {settings.tagline && <p className="text-[11px] text-slate-600">{settings.tagline}</p>}

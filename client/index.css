@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 @layer utilities {
   .custom-scrollbar::-webkit-scrollbar {
@@ -30,6 +31,10 @@
     height: auto !important;
     padding: 0 !important;
     margin: 0 !important;
+  }
+  body:has(#printable-receipt) main > div > :not(:has(#printable-receipt)),
+  body:has(#payment-voucher-print) main > div > :not(:has(#payment-voucher-print)) {
+    display: none !important;
   }
   #printable-receipt, #printable-statement, #payment-voucher-print {
     display: block !important;

@@ -24,6 +24,7 @@ function AppContent() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [lowStockCount, setLowStockCount] = useState(0);
   const [selectedLedgerCustomerId, setSelectedLedgerCustomerId] = useState<string | undefined>(undefined);
+  const [selectedPaymentCustomerId, setSelectedPaymentCustomerId] = useState<string | undefined>(undefined);
 
   // Refresh low stock alerts when user or active tab changes
   useEffect(() => {
@@ -87,9 +88,15 @@ function AppContent() {
                 setSelectedLedgerCustomerId(id);
                 setActiveTab('ledger');
               }}
+              onSelectCustomerForPayment={(id) => {
+                setSelectedPaymentCustomerId(id);
+                setActiveTab('payments');
+              }}
             />
           )}
-          {activeTab === 'payments' && <PaymentCollectionView />}
+          {activeTab === 'payments' && (
+            <PaymentCollectionView initialCustomerId={selectedPaymentCustomerId} />
+          )}
           {activeTab === 'invoices' && <InvoiceListView setActiveTab={setActiveTab} />}
           {activeTab === 'inventory' && <ProductListView />}
           {activeTab === 'suppliers' && <SupplierListView />}

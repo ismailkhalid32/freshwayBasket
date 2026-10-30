@@ -19,7 +19,11 @@ import {
   Plus,
 } from 'lucide-react';
 
-export const PaymentCollectionView: React.FC = () => {
+interface PaymentCollectionViewProps {
+  initialCustomerId?: string;
+}
+
+export const PaymentCollectionView: React.FC<PaymentCollectionViewProps> = ({ initialCustomerId }) => {
   const { settings, formatCurrency } = useSettings();
   const { user, isAdmin } = useAuth();
 
@@ -30,7 +34,7 @@ export const PaymentCollectionView: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
 
   // Form State
-  const [selectedCustomerId, setSelectedCustomerId] = useState('');
+  const [selectedCustomerId, setSelectedCustomerId] = useState(initialCustomerId || '');
   const [amount, setAmount] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('Cash');
   const [referenceNumber, setReferenceNumber] = useState('');
@@ -70,6 +74,12 @@ export const PaymentCollectionView: React.FC = () => {
     loadData();
   }, []);
 
+  useEffect(() => {
+    if (initialCustomerId) {
+      setSelectedCustomerId(initialCustomerId);
+    }
+  }, [initialCustomerId]);
+
   const selectedCustomer = customers.find((c) => c.id === selectedCustomerId);
 
   // Set payment to full outstanding amount
@@ -100,6 +110,7 @@ export const PaymentCollectionView: React.FC = () => {
         customerId: selectedCustomerId,
         amount: numAmount,
         paymentMethod,
+        paymentDate,
         referenceNumber,
         notes,
         createdByName: user?.fullName || 'Cashier',
